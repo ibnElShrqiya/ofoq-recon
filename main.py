@@ -33,9 +33,10 @@ except ImportError:
     Panel = Table = Text = None
 
 APP_NAME = "OFOQ Recon"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 USER_AGENT = f"OFOQ-Recon/{VERSION} (authorized low-impact security assessment)"
-TIMEOUT = 8
+CONNECT_TIMEOUT = 10
+READ_TIMEOUT = 20
 MAX_REDIRECTS = 5
 MAX_BODY_BYTES = 256_000
 PRIVATE_NETS = (
@@ -144,27 +145,41 @@ def safe_get(session: requests.Session, url: str, allow_private: bool, headers: 
     for _ in range(MAX_REDIRECTS + 1):
         guard_url(current, allow_private)
         response = session.get(
-            current, allow_redirects=False, timeout=TIMEOUT, stream=True,
+            current, allow_redirects=False,
+            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), stream=True,
             headers=headers or {}, verify=True
         )
-        # Read a bounded response body to avoid downloading large resources.
-        chunks = []
-        total = 0
-        try:
-            for chunk in response.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
-                remaining = MAX_BODY_BYTES - total
-                if remaining <= 0:
-                    break
-                chunks.append(chunk[:remaining])
-                total += min(len(chunk), remaining)
-                if total >= MAX_BODY_BYTES:
-                    break
-            response._content = b"".join(chunks)
+        # Redirect bodies are irrelevant; don't let a slow redirect body hide its status.
+        if response.is_redirect or response.is_permanent_redirect:
+            response._content = b""
             response._content_consumed = True
-        finally:
             response.close()
+        else:
+            # Read a bounded response body. If the body stalls after headers arrive,
+            # keep the HTTP status and headers and report a partial-body warning.
+            chunks = []
+            total = 0
+            body_read_error = None
+            try:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    remaining = MAX_BODY_BYTES - total
+                    if remaining <= 0:
+                        break
+                    chunks.append(chunk[:remaining])
+                    total += min(len(chunk), remaining)
+                    if total >= MAX_BODY_BYTES:
+                        break
+            except requests.exceptions.ReadTimeout as exc:
+                body_read_error = f"Response body read timed out after {READ_TIMEOUT}s; partial response retained."
+            except requests.exceptions.ChunkedEncodingError as exc:
+                body_read_error = f"Response body ended unexpectedly; partial response retained: {exc}"
+            finally:
+                response._content = b"".join(chunks)
+                response._content_consumed = True
+                response.close()
+            response._ofoq_body_read_error = body_read_error
         history.append({"url": current, "status_code": response.status_code})
         if response.is_redirect or response.is_permanent_redirect:
             location = response.headers.get("Location")
@@ -180,7 +195,7 @@ def tls_info(host: str, port: int = 443) -> dict[str, Any]:
     result: dict[str, Any] = {"checked": False}
     context = ssl.create_default_context()
     try:
-        with socket.create_connection((host, port), timeout=TIMEOUT) as sock:
+        with socket.create_connection((host, port), timeout=CONNECT_TIMEOUT) as sock:
             with context.wrap_socket(sock, server_hostname=host) as tls_sock:
                 cert = tls_sock.getpeercert()
                 result = {
@@ -282,7 +297,12 @@ def scan(url: str, allow_private: bool) -> dict[str, Any]:
             "content_length_header": response.headers.get("Content-Length"),
             "response_bytes_read": len(response.content),
             "elapsed_seconds": round(time.time() - started, 3),
+            "body_read_warning": getattr(response, "_ofoq_body_read_error", None),
         }
+        if response_data["body_read_warning"]:
+            add_finding(findings, "HTTP-003", "Response body read timed out", "info", "partial",
+                        response_data["body_read_warning"] + " HTTP status and headers were still inspected.",
+                        "Retry later or increase READ_TIMEOUT if the target is expected to respond slowly.")
         headers_data = inspect_headers(response.headers, findings)
         if response.status_code >= 500:
             add_finding(findings, "HTTP-001", "Server error response", "low", "observed",
@@ -405,95 +425,4 @@ def write_html(report: dict[str, Any], path: Path) -> None:
 <style>
 :root{{--bg:#07111f;--card:#0e1b2d;--line:#22334a;--text:#e5edf7;--muted:#9fb0c5;--cyan:#22d3ee}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 system-ui,Segoe UI,Arial,sans-serif}}
-header{{padding:32px 5vw;background:linear-gradient(120deg,#0b1b32,#103344);border-bottom:1px solid var(--line)}}
-main{{max-width:1400px;margin:auto;padding:28px 5vw}}h1{{margin:0;color:var(--cyan);letter-spacing:.04em}}h2{{margin-top:28px}}.muted{{color:var(--muted)}}.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin:18px 0}}
-.metric,.card{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}}.metric span{{display:block;color:var(--muted)}}.metric strong{{font-size:28px}}
-.table-wrap{{overflow-x:auto;border:1px solid var(--line);border-radius:12px}}table{{width:100%;border-collapse:collapse;min-width:1000px}}th,td{{padding:12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}}th{{background:#12243a;color:var(--cyan)}}tr:last-child td{{border-bottom:0}}.badge{{display:inline-block;color:white;padding:2px 8px;border-radius:5px;font-size:12px;font-weight:700}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#050b14;border:1px solid var(--line);padding:14px;border-radius:8px;color:#c9d8e9}}
-footer{{color:var(--muted);padding:24px 5vw;border-top:1px solid var(--line)}}@media(max-width:600px){{header{{padding:24px 5vw}}main{{padding:20px 4vw}}}}
-</style></head><body>
-<header><h1>OFOQ RECON</h1><div>Web Security Assessment Report</div>
-<p class="muted">Target: <strong>{html.escape(report.get('target',''))}</strong><br>
-Generated: {html.escape(report.get('scan_timestamp_utc',''))}</p></header>
-<main>
-<div class="card"><strong>Scope note</strong><p>{html.escape(report.get('scope_note',''))}</p>
-<p class="muted">Highest severity: {html.escape(str(summary.get('highest_severity','none')).upper())} · Total findings: {int(summary.get('total_findings',0))}</p></div>
-<h2>Severity summary</h2><div class="metrics">{count_html}</div>
-<h2>Findings</h2>
-<div class="table-wrap"><table><thead><tr><th>ID</th><th>Finding</th><th>Severity</th><th>Status</th><th>Details</th><th>Recommendation</th></tr></thead>
-<tbody>{''.join(rows) if rows else '<tr><td colspan="6">No findings recorded.</td></tr>'}</tbody></table></div>
-<h2>HTTP response</h2><pre>{http_json}</pre><h2>TLS details</h2><pre>{tls_json}</pre>
-<h2>Resolved addresses</h2><pre>{html.escape(', '.join(report.get('resolved_ips', [])))}</pre>
-</main><footer>OFOQ Recon {VERSION} · Low-impact checks only. Validate findings manually before treating them as vulnerabilities.</footer>
-</body></html>"""
-    path.write_text(html_doc, encoding="utf-8")
-
-
-def show_results(report: dict[str, Any]) -> None:
-    summary = report["summary"]
-    say(f"\n[bold green]Scan complete[/bold green]" if console else "\nScan complete")
-    say(f"HTTP status: {report.get('http', {}).get('status_code', 'not available')}")
-    say(f"Findings: {summary['total_findings']} | Highest severity: {summary['highest_severity'].upper()}")
-    if console:
-        table = Table(title="Findings", show_lines=True)
-        for col in ("ID", "Severity", "Status", "Finding", "Recommendation"):
-            table.add_column(col, overflow="fold")
-        for f in report["findings"]:
-            style = {"critical": "bold red", "high": "red", "medium": "yellow", "low": "blue", "info": "dim"}.get(f["severity"], "")
-            table.add_row(f["id"], f["severity"].upper(), f["status"], f["title"] + "\n" + f["detail"], f["recommendation"], style=style)
-        console.print(table)
-    else:
-        for f in report["findings"]:
-            print(f"- [{f['severity'].upper()}] {f['title']}: {f['detail']}")
-
-
-def interactive() -> None:
-    banner()
-    print("Use only on websites you own or have explicit permission to assess.")
-    try:
-        target = input("\nTarget URL (e.g. https://example.com): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\nExiting.")
-        return
-    if not target:
-        print("No target supplied.")
-        return
-    private = input("Allow private/local IP targets? Only for your own authorized lab [y/N]: ").strip().lower() == "y"
-    run_scan(target, private, Path("reports"))
-
-
-def run_scan(target: str, allow_private: bool, output_dir: Path) -> None:
-    try:
-        report = scan(target, allow_private)
-    except Exception as exc:
-        say(f"[bold red]Scan stopped:[/bold red] {exc}" if console else f"Scan stopped: {exc}")
-        raise SystemExit(1)
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    host = re.sub(r"[^A-Za-z0-9_.-]+", "_", report.get("hostname", "target"))[:80] or "target"
-    json_path = output_dir / f"{host}_{stamp}.json"
-    html_path = output_dir / f"{host}_{stamp}.html"
-    write_json(report, json_path)
-    write_html(report, html_path)
-    show_results(report)
-    say(f"\n[green]JSON report:[/green] {json_path}" if console else f"\nJSON report: {json_path}")
-    say(f"[green]HTML report:[/green] {html_path}" if console else f"HTML report: {html_path}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="ofoq-recon",
-        description="Low-impact web security checks for authorized targets.",
-        epilog="Private/local IP targets are blocked by default. Use --allow-private only for systems you own or are authorized to test."
-    )
-    parser.add_argument("url", nargs="?", help="Target URL, e.g. https://example.com")
-    parser.add_argument("--allow-private", action="store_true", help="Allow private/local IP targets for an authorized lab")
-    parser.add_argument("--out", default="reports", help="Output directory for HTML and JSON reports (default: reports)")
-    args = parser.parse_args()
-    if args.url:
-        banner()
-        run_scan(args.url, args.allow_private, Path(args.out))
-    else:
-        interactive()
-
-
-if __name__ == "__main__":
-    main()
+header{{padding:32px 5vw;backg
